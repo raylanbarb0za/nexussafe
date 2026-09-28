@@ -1,0 +1,10 @@
+{
+  "total_leituras": 200,
+  "anomalias_detectadas": 16,
+  "risco_medio_pct": 4.3,
+  "risco_maximo_pct": 100.0,
+  "distribuicao_alertas": {
+    "NORMAL": 184,
+    "CRÍTICO": 16
+  }
+}
