@@ -1,487 +1,562 @@
 """
-NEXUS-SAFE: Protótipo de Plataforma de Segurança Cognitiva Para Identificação e Predição de Riscos em Ambientes Industriais
+NEXUS SAFE - Protótipo v2
+Segurança industrial preditiva: Grafo de Risco Emergente + detecção de anomalias (Isolation Forest).
+
+O que esta versão implementa (tudo SIMULADO em um único computador, em Python):
+  - Aquisição estilo SCADA/IIoT : "tags" publicadas por um simulador (SimuladorSCADA)
+  - Barramento de mensagens     : fila em memória que imita um broker MQTT, com assinatura HMAC
+  - Edge Computing              : NoBorda faz a inferência local e só transmite eventos relevantes
+  - Nuvem/central               : NoCentral treina o modelo, valida mensagens e consolida eventos
+  - Grafo de Risco Emergente    : o risco é CALCULADO a partir dos nós e arestas do grafo
+  - Predição                    : tendência (regressão linear em janela) projetada para N minutos
+  - Gêmeo Digital simplificado  : estado virtual da máquina + simulação "e se?" (what-if)
+  - Avaliação                   : precisão/recall/F1 contra rótulos reais do gerador e baselines
+
+Limitações (declarar no texto do TCC): dados sintéticos, um único processo (threads + fila),
+pesos das arestas definidos por especialista (não aprendidos), sem protocolo industrial real.
 """
 
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import networkx as nx
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
+import hashlib
+import hmac
 import json
+import queue
+import sys
+import threading
+import time
+from collections import deque
 from pathlib import Path
 
-# ================================================================================
-# 1. CLASSE DO GRAFO DE RISCO EMERGENTE
-# ================================================================================
+import networkx as nx
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import precision_recall_fscore_support
+
+# ==============================================================================
+# 0. CONFIGURAÇÃO (fonte única de verdade para limiares, pesos e correlações)
+# ==============================================================================
+
+# inicio  = valor a partir do qual o fator começa a contribuir (ativação > 0)
+# limiar  = valor em que o fator é considerado totalmente ativo (ativação = 1)
+# centro  = quando existe, o desvio é medido em relação a ele (ex.: umidade)
+FATORES = {
+    'temperatura':         dict(no='temp',     rotulo='Temperatura elevada',       peso=0.30, inicio=55,  limiar=70),
+    'vibracao':            dict(no='vibra',    rotulo='Vibração alta',             peso=0.35, inicio=4.5, limiar=7),
+    'pressao':             dict(no='pressao',  rotulo='Pressão elevada',           peso=0.25, inicio=14,  limiar=20),
+    'fadiga_operador':     dict(no='fadiga',   rotulo='Fadiga do operador',        peso=0.28, inicio=5,   limiar=7),
+    'umidade':             dict(no='umidade',  rotulo='Umidade anômala',           peso=0.15, inicio=20,  limiar=30, centro=50),
+    'presenca_area_risco': dict(no='presenca', rotulo='Operador em área de risco', peso=0.20, inicio=0,   limiar=1),
+}
+
+# (origem, destino, peso): quando os dois fatores estão ativos, o risco é amplificado
+CORRELACOES = [
+    ('temp', 'vibra', 0.60),
+    ('vibra', 'fadiga', 0.50),
+    ('pressao', 'temp', 0.45),
+    ('umidade', 'temp', 0.40),
+    ('presenca', 'temp', 0.50),
+    ('presenca', 'vibra', 0.50),
+]
+
+NIVEIS = {'CRITICO': 0.70, 'ALERTA': 0.40, 'ATENCAO': 0.25}
+
+# "Tags" no estilo SCADA -> variável interna
+TAG_PARA_COLUNA = {
+    'MAQ01.TEMP': 'temperatura',
+    'MAQ01.VIB': 'vibracao',
+    'MAQ01.PRESS': 'pressao',
+    'OPER01.FADIGA': 'fadiga_operador',
+    'AMB01.UMID': 'umidade',
+    'AREA01.PRESENCA': 'presenca_area_risco',
+}
+
+CHAVE_SECRETA = b'chave-de-demonstracao'   # em produção: gerenciada por cofre de segredos
+HEARTBEAT = 60                              # a cada N leituras o nó de borda envia um sinal de vida
+HORIZONTE_MIN = 8                           # quantos minutos à frente a tendência é projetada
+JANELA_TENDENCIA = 8                        # leituras usadas para estimar a tendência
+
+
+def classificar_nivel(risco, anomalia_ia):
+    """Corrige o ramo inalcançável da v1: a IA sozinha só eleva a ATENÇÃO."""
+    if risco >= NIVEIS['CRITICO']:
+        return 'CRÍTICO'
+    if risco >= NIVEIS['ALERTA']:
+        return 'ALERTA'
+    if risco >= NIVEIS['ATENCAO'] or anomalia_ia:
+        return 'ATENÇÃO'
+    return 'NORMAL'
+
+
+# ==============================================================================
+# 1. GRAFO DE RISCO EMERGENTE
+# ==============================================================================
 
 class GrafoRiscoEmergente:
-    """Representa as correlações entre fatores de risco em um ambiente industrial"""
-    
+    """Nós = fatores de risco; arestas ponderadas = contribuição individual e correlações.
+    O risco final é calculado A PARTIR do grafo (v1 apenas o desenhava)."""
+
     def __init__(self):
         self.G = nx.DiGraph()
-        self._criar_grafo()
-    
-    def _criar_grafo(self):
-        """Cria o grafo com fatores de risco e suas correlações"""
-        
-        # Adicionar nós (fatores de risco)
-        fatores = {
-            'temp': 'Temperatura Elevada (>70°C)',
-            'vibra': 'Vibração Alta (>7)',
-            'pressao': 'Pressão Elevada (>20bar)',
-            'fadiga': 'Fadiga do Operador (>7)',
-            'umidade': 'Umidade Anômala',
-            'risco_critico': '⚠️ RISCO CRÍTICO'
-        }
-        
-        for chave, descricao in fatores.items():
-            self.G.add_node(chave, label=descricao)
-        
-        # Adicionar arestas (pesos = força da correlação)
-        # Formato: (origem, destino, peso_correlacao)
-        correlacoes = [
-            # Riscos individuais -> Risco crítico
-            ('temp', 'risco_critico', 0.30),       # Temperatura sozinha = 30% risco
-            ('vibra', 'risco_critico', 0.35),      # Vibração = 35%
-            ('pressao', 'risco_critico', 0.25),    # Pressão = 25%
-            ('fadiga', 'risco_critico', 0.28),     # Fadiga = 28%
-            ('umidade', 'risco_critico', 0.15),    # Umidade = 15%
-            
-            # Correlações entre fatores (amplificam risco)
-            ('temp', 'vibra', 0.60),                # Temp + Vibra = FORTE
-            ('vibra', 'fadiga', 0.50),              # Vibra + Fadiga = FORTE
-            ('pressao', 'temp', 0.45),              # Pressão + Temp = MÉDIA
-            ('umidade', 'temp', 0.40),              # Umidade + Temp = MÉDIA
-        ]
-        
-        for origem, destino, peso in correlacoes:
-            self.G.add_edge(origem, destino, weight=peso)
+        for col, f in FATORES.items():
+            self.G.add_node(f['no'], coluna=col, label=f['rotulo'], ativacao=0.0)
+        self.G.add_node('risco_critico', label='RISCO CRÍTICO')
+        for f in FATORES.values():
+            self.G.add_edge(f['no'], 'risco_critico', weight=f['peso'], tipo='individual')
+        for u, v, w in CORRELACOES:
+            self.G.add_edge(u, v, weight=w, tipo='correlacao')
 
-    def calcular_risco_correlado(self, leitura_sensores):
+    @staticmethod
+    def _ativacao(f, valor):
+        x = abs(valor - f['centro']) if 'centro' in f else valor
+        return float(np.clip((x - f['inicio']) / (f['limiar'] - f['inicio']), 0.0, 1.0))
 
-        risco_total = 0
+    def ativacoes(self, leitura):
+        return {f['no']: self._ativacao(f, leitura[col]) for col, f in FATORES.items()}
 
-        # PASSO 1: Calcular risco individual por fator
-        risco_temp = 0.30 if leitura_sensores.get('temperatura', 0) > 70 else 0
-        risco_vibra = 0.35 if leitura_sensores.get('vibracao', 0) > 7 else 0
-        risco_pressao = 0.25 if leitura_sensores.get('pressao', 0) > 20 else 0
-        risco_fadiga = 0.28 if leitura_sensores.get('fadiga_operador', 0) > 7 else 0
-        risco_umidade = 0.15 if leitura_sensores.get('umidade', 0) > 80 or leitura_sensores.get('umidade', 0) < 20 else 0
+    def calcular(self, leitura, persistir=False):
+        """Retorna o risco (0-1). Com persistir=True o estado dos nós é atualizado (grafo dinâmico)."""
+        ativ = self.ativacoes(leitura)
+        if persistir:
+            nx.set_node_attributes(self.G, ativ, 'ativacao')
 
-        # PASSO 2: Somar riscos individuais
-        risco_total = risco_temp + risco_vibra + risco_pressao + risco_fadiga + risco_umidade
+        individual = sum(self.G[n]['risco_critico']['weight'] * a for n, a in ativ.items())
+        risco = individual
+        for u, v, d in self.G.edges(data=True):
+            if d['tipo'] == 'correlacao':
+                risco *= 1 + d['weight'] * min(ativ[u], ativ[v])
 
-        # PASSO 3: Aplicar amplificações por correlações (RISCO EMERGENTE)
-        # Quando múltiplos fatores ocorrem simultaneamente, o risco AMPLIFICA
-
-        if leitura_sensores.get('temperatura', 0) > 70 and leitura_sensores.get('vibracao', 0) > 7:
-            # Correlação Temp + Vibra = amplifica em 60%
-            risco_total *= (1 + 0.60)
-
-        if leitura_sensores.get('vibracao', 0) > 7 and leitura_sensores.get('fadiga_operador', 0) > 7:
-            # Correlação Vibra + Fadiga = amplifica em 50%
-            risco_total *= (1 + 0.50)
-
-        if leitura_sensores.get('pressao', 0) > 20 and leitura_sensores.get('temperatura', 0) > 70:
-            # Correlação Pressão + Temp = amplifica em 45%'
-            risco_total *= (1 + 0.45)
-
-        # Limitar entre 0 e 1
-        return min(risco_total, 1.0)
-
-    def obter_info_grafo(self):
-        """Retorna informações sobre o grafo"""
+        risco, individual = min(risco, 1.0), min(individual, 1.0)
         return {
-            'total_nos': self.G.number_of_nodes(),
-            'total_arestas': self.G.number_of_edges(),
-            'nodes': dict(self.G.nodes(data=True)),
-            'edges': [(u, v, d['weight']) for u, v, d in self.G.edges(data=True)]
+            'risco': risco,
+            'risco_individual': individual,
+            'ganho_correlacao': risco - individual,   # parcela "emergente"
+            'fatores': [self.G.nodes[n]['label'] for n, a in ativ.items() if a >= 0.5],
         }
 
 
-# ================================================================================
-# 2. CLASSE DE INTELIGÊNCIA ARTIFICIAL (DETECÇÃO DE ANOMALIAS)
-# ================================================================================
+# ==============================================================================
+# 2. SIMULADOR DE AQUISIÇÃO (SCADA/IIoT) E GERADOR DE CENÁRIOS ROTULADOS
+# ==============================================================================
+
+class SimuladorSCADA:
+    TIPOS_PONTUAIS = ['temp_alta', 'vibra_alta', 'pressao_temp', 'combinado_acima', 'combinado_sublimiar']
+
+    def __init__(self, seed=42):
+        self.rng = np.random.default_rng(seed)
+
+    def _normal(self, n):
+        r = self.rng
+        return pd.DataFrame({
+            'temperatura': r.normal(45, 3, n),
+            'vibracao': r.normal(2.2, 0.4, n),
+            'pressao': r.normal(10.5, 0.8, n),
+            'fadiga_operador': r.normal(3, 1, n),
+            'umidade': r.normal(50, 8, n),
+            'presenca_area_risco': (r.random(n) < 0.20).astype(int),
+        })
+
+    def gerar_baseline(self, n=1000):
+        """Histórico de operação normal, usado só para TREINAR o modelo (separado do teste)."""
+        return self._normal(n)
+
+    def gerar_teste(self, n=600, n_por_tipo=10, n_derivas=4, comp_deriva=15):
+        r = self.rng
+        df = self._normal(n)
+        df['timestamp'] = pd.date_range('2026-10-01 08:00', periods=n, freq='min')
+        df['cenario'] = 'normal'
+        df['episodio'] = -1
+        livres = set(range(n))
+
+        # Derivas: temperatura e vibração subindo ao longo de ~15 min (dá estrutura temporal à predição)
+        inicios = np.linspace(40, n - 40, n_derivas).astype(int)
+        t = np.linspace(0, 1, comp_deriva)
+        for e, ini in enumerate(inicios):
+            idx = np.arange(ini, ini + comp_deriva)
+            livres -= set(idx.tolist())
+            df.loc[idx, 'temperatura'] = 48 + 30 * t + r.normal(0, 1, comp_deriva)
+            df.loc[idx, 'vibracao'] = 2.5 + 5 * t + r.normal(0, 0.2, comp_deriva)
+            df.loc[idx, 'fadiga_operador'] = r.normal(6, 0.5, comp_deriva)
+            df.loc[idx, 'presenca_area_risco'] = 1
+            df.loc[idx, 'cenario'] = 'deriva'
+            df.loc[idx, 'episodio'] = e
+
+        # Situações pontuais rotuladas
+        posicoes = r.choice(sorted(livres), size=n_por_tipo * len(self.TIPOS_PONTUAIS), replace=False)
+        for i, p in enumerate(posicoes):
+            tipo = self.TIPOS_PONTUAIS[i % len(self.TIPOS_PONTUAIS)]
+            df.loc[p, 'cenario'] = tipo
+            if tipo == 'temp_alta':
+                df.loc[p, 'temperatura'] = r.uniform(72, 85)
+            elif tipo == 'vibra_alta':
+                df.loc[p, 'vibracao'] = r.uniform(7.5, 9)
+            elif tipo == 'pressao_temp':
+                df.loc[p, 'pressao'] = r.uniform(20, 24)
+                df.loc[p, 'temperatura'] = r.uniform(70, 76)
+            elif tipo == 'combinado_acima':
+                df.loc[p, ['temperatura', 'vibracao', 'fadiga_operador']] = [r.uniform(70, 80), r.uniform(7, 9), r.uniform(7, 10)]
+                df.loc[p, 'presenca_area_risco'] = 1
+            else:  # combinado_sublimiar: cada fator ainda "normal" sozinho, perigoso em conjunto
+                df.loc[p, ['temperatura', 'vibracao', 'fadiga_operador']] = [r.uniform(60, 66), r.uniform(4.8, 6.0), r.uniform(5.2, 6.3)]
+                df.loc[p, 'presenca_area_risco'] = 1
+
+        cols = [c for c in FATORES if c != 'presenca_area_risco']
+        df[cols] = df[cols].clip(lower=0)
+        # rótulo real: 1 = situação de risco injetada. Derivas são avaliadas à parte (antecedência).
+        df['rotulo_real'] = (~df['cenario'].isin(['normal', 'deriva'])).astype(int)
+        return df
+
+    @staticmethod
+    def para_tags(linha, seq):
+        tags = {tag: float(linha[col]) for tag, col in TAG_PARA_COLUNA.items()}
+        return {'seq': seq, 'ts': str(linha['timestamp']), 'qualidade': 'GOOD', 'tags': tags}
+
+
+# ==============================================================================
+# 3. DETECÇÃO DE ANOMALIAS (IA)
+# ==============================================================================
 
 class DetectorAnomaliasIA:
-    """
-    Usa Isolation Forest para detectar padrões anômalos nos dados
-    """
-    
-    def __init__(self, taxa_contaminacao=0.10):
-        self.modelo = IsolationForest(contamination=taxa_contaminacao, random_state=42)
-        self.scaler = StandardScaler()
-        self.features_treinadas = None
-        self.eh_treinado = False
-    
-    def treinar(self, dados):
-        """
-        Treina o modelo com dados históricos
-        
-        Args:
-            dados: DataFrame com colunas de sensores
-        """
-        features = ['temperatura', 'vibracao', 'pressao', 'fadiga_operador', 'umidade']
-        X = dados[features].values
-        
-        # Normalizar dados
-        X_scaled = self.scaler.fit_transform(X)
-        
-        # Treinar modelo
-        self.modelo.fit(X_scaled)
-        self.features_treinadas = features
-        self.eh_treinado = True
-        
-        print(f" Modelo IA treinado com {len(dados)} amostras")
-    
-    def detectar_anomalias(self, dados):
-        """
-        Detecta anomalias em novos dados
-        
-        Args:
-            dados: DataFrame com novos sensores
-        
-        Returns:
-            array: -1 para anomalia, 1 para normal
-        """
-        if not self.eh_treinado:
-            raise ValueError("Modelo não foi treinado! Execute treinar() primeiro.")
-        
-        features = self.features_treinadas
-        X = dados[features].values
-        X_scaled = self.scaler.transform(X)
-        
-        predicoes = self.modelo.predict(X_scaled)
-        return predicoes == -1  # True se anomalia
-    
-    def calcular_score_anomalia(self, dados):
-        """
-        Calcula score de anomalia (0 a 1) para cada amostra
-        
-        Returns:
-            array: scores entre 0 e 1
-        """
-        if not self.eh_treinado:
-            raise ValueError("Modelo não foi treinado!")
-        
-        features = self.features_treinadas
-        X = dados[features].values
-        X_scaled = self.scaler.transform(X)
-        
-        # Score da anomalia (quanto mais negativo, mais anômalo)
-        scores = -self.modelo.score_samples(X_scaled)
-        # Normalizar entre 0 e 1
-        scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-10)
-        return scores
+    """Isolation Forest treinado em histórico NORMAL (aprendizado não supervisionado).
+    Não usa StandardScaler: árvores de isolamento não dependem de escala."""
+
+    def __init__(self, taxa_falso_alarme=0.01):
+        self.modelo = IsolationForest(n_estimators=100, contamination=taxa_falso_alarme, random_state=42)
+        self.colunas = list(FATORES)
+
+    def treinar(self, baseline):
+        self.modelo.fit(baseline[self.colunas].values)
+        return self
+
+    def avaliar(self, leitura):
+        X = np.array([[leitura[c] for c in self.colunas]])
+        anomalia = bool(self.modelo.predict(X)[0] == -1)
+        score = float(-self.modelo.score_samples(X)[0])   # ~0.5 = fronteira; maior = mais anômalo
+        return anomalia, score
 
 
-# ================================================================================
-# 3. CLASSE PRINCIPAL DO NEXUS-SAFE
-# ================================================================================
+# ==============================================================================
+# 4. BARRAMENTO DE MENSAGENS (imita um broker MQTT) COM INTEGRIDADE HMAC
+# ==============================================================================
 
-class NEXUS_SAFE:
-    """
-    Sistema completo de detecção e predição de riscos
-    """
-    
-    def __init__(self):
+class Barramento:
+    def __init__(self, chave=CHAVE_SECRETA):
+        self._q = queue.Queue()
+        self._chave = chave
+        self.mensagens = 0
+        self.bytes = 0
+
+    def _assinar(self, corpo):
+        return hmac.new(self._chave, corpo.encode(), hashlib.sha256).hexdigest()
+
+    def publicar(self, topico, payload, assinatura=None):
+        corpo = json.dumps(payload, sort_keys=True, default=str)
+        self._q.put({'topico': topico, 'corpo': corpo, 'assinatura': assinatura or self._assinar(corpo)})
+        self.mensagens += 1
+        self.bytes += len(corpo.encode())
+
+    def encerrar(self):
+        self._q.put(None)
+
+    def consumir(self):
+        return self._q.get()
+
+    def validar(self, msg):
+        """Retorna o payload se a assinatura for válida; caso contrário, None."""
+        if not hmac.compare_digest(msg['assinatura'], self._assinar(msg['corpo'])):
+            return None
+        return json.loads(msg['corpo'])
+
+
+# ==============================================================================
+# 5. NÓ DE BORDA (EDGE) - inferência local, transmissão seletiva
+# ==============================================================================
+
+class NoBorda:
+    def __init__(self, id_no, barramento):
+        self.id = id_no
+        self.bus = barramento
         self.grafo = GrafoRiscoEmergente()
-        self.detector_ia = DetectorAnomaliasIA(taxa_contaminacao=0.08)
-        self.historico = []
-        self.alertas = []
-    
-    def gerar_dados_simulados(self, n_leituras=200, seed=42):
-        """
-        Gera dados simulados de sensores industriais
-        
-        Args:
-            n_leituras: número de leituras a gerar
-            seed: seed para reprodutibilidade
-        
-        Returns:
-            DataFrame com dados simulados
-        """
-        np.random.seed(seed)
-        
-        # Valores normais (com pequenas variações)
-        dados = {
-            'timestamp': [datetime.now() - timedelta(minutes=i) for i in range(n_leituras)],
-            'temperatura': np.random.normal(45, 3, n_leituras),      # Média 45°C
-            'vibracao': np.random.normal(2.2, 0.4, n_leituras),      # Média 2.2
-            'pressao': np.random.normal(10.5, 0.8, n_leituras),      # Média 10.5 bar
-            'fadiga_operador': np.random.normal(3, 1, n_leituras),   # Média 3
-            'umidade': np.random.normal(50, 8, n_leituras),          # Média 50%
+        self.detector = None
+        self.janela = deque(maxlen=JANELA_TENDENCIA)
+        self.log = []          # log local (usado na avaliação do experimento)
+        self.enviados = []
+
+    def implantar_modelo(self, detector):
+        """Modelo treinado na central e implantado na borda (treino na nuvem, inferência na borda)."""
+        self.detector = detector
+
+    def _projetar(self):
+        if len(self.janela) < self.janela.maxlen:
+            return None
+        cols = list(FATORES)
+        Y = np.array([[l[c] for c in cols] for l in self.janela])
+        t = np.arange(len(Y))
+        # Inclinação robusta (estilo Theil-Sen): mediana das inclinações entre todos os pares de pontos.
+        # Um pico isolado quase não altera a mediana, ao contrário de uma regressão por mínimos quadrados.
+        i, j = np.triu_indices(len(Y), k=1)
+        a = np.median((Y[j] - Y[i]) / (j - i)[:, None], axis=0)
+        b = np.median(Y - a * t[:, None], axis=0)
+        proj = dict(zip(cols, a * (len(Y) - 1 + HORIZONTE_MIN) + b))
+        proj['presenca_area_risco'] = float(self.janela[-1]['presenca_area_risco'])
+        return {c: max(v, 0.0) for c, v in proj.items()}
+
+    def processar(self, msg_tags):
+        t0 = time.perf_counter()
+        leitura = {col: msg_tags['tags'][tag] for tag, col in TAG_PARA_COLUNA.items()}
+        self.janela.append(leitura)
+
+        r = self.grafo.calcular(leitura, persistir=True)
+        anomalia, score = self.detector.avaliar(leitura)
+        proj = self._projetar()
+        risco_prev = self.grafo.calcular(proj)['risco'] if proj else 0.0
+        preditivo = proj is not None and risco_prev >= NIVEIS['CRITICO'] and r['risco'] < NIVEIS['CRITICO']
+        nivel = classificar_nivel(r['risco'], anomalia)
+        proc_ms = (time.perf_counter() - t0) * 1000
+
+        registro = {
+            'seq': msg_tags['seq'], 'ts': msg_tags['ts'], 'risco': r['risco'],
+            'risco_individual': r['risco_individual'], 'ganho_correlacao': r['ganho_correlacao'],
+            'risco_previsto': risco_prev, 'alerta_preditivo': bool(preditivo),
+            'anomalia_ia': anomalia, 'score_ia': score, 'nivel': nivel,
+            'fatores': ', '.join(r['fatores']) or 'Nenhum', 'proc_ms': proc_ms,
         }
-        
-        df = pd.DataFrame(dados)
-        
-        # Adicionar ANOMALIAS REALISTAS (situações de risco)
-        indices_anomalias = np.random.choice(n_leituras, size=int(n_leituras*0.08), replace=False)
-        
-        for idx in indices_anomalias:
-            tipo_anomalia = np.random.choice(['temp_alta', 'vibra_alta', 'correlacao'])
-            
-            if tipo_anomalia == 'temp_alta':
-                df.loc[idx, 'temperatura'] = np.random.uniform(72, 85)
-            elif tipo_anomalia == 'vibra_alta':
-                df.loc[idx, 'vibracao'] = np.random.uniform(7.5, 9)
-            else:  # correlacao (múltiplos fatores)
-                df.loc[idx, 'temperatura'] = np.random.uniform(70, 80)
-                df.loc[idx, 'vibracao'] = np.random.uniform(7, 9)
-                df.loc[idx, 'fadiga_operador'] = np.random.uniform(7, 10)
-        
-        # Manter valores positivos (apenas colunas numéricas)
-        colunas_numericas = ['temperatura', 'vibracao', 'pressao', 'fadiga_operador', 'umidade']
-        df[colunas_numericas] = df[colunas_numericas].clip(lower=0)
-        
-        return df
-    
-    def processar_dados(self, dados):
-        """
-        Pipeline completo de análise dos dados
-        
-        Args:
-            dados: DataFrame com leituras de sensores
-        
-        Returns:
-            DataFrame com análises completas
-        """
-        # ETAPA 1: Treinar modelo IA
-        print("\n Etapa 1: Treinando modelo de IA...")
-        self.detector_ia.treinar(dados)
-        
-        # ETAPA 2: Detectar anomalias pela IA
-        print("Etapa 2: Detectando anomalias...")
-        dados['anomalia_ia'] = self.detector_ia.detectar_anomalias(dados)
-        dados['score_anomalia'] = self.detector_ia.calcular_score_anomalia(dados)
-        
-        # ETAPA 3: Calcular risco correlado pelo grafo
-        print("Etapa 3: Calculando risco correlado...")
-        dados['risco_correlado'] = dados.apply(
-            lambda row: self.grafo.calcular_risco_correlado(row.to_dict()),
-            axis=1
-        )
-        
-        # ETAPA 4: Classificar nível de alerta
-        print("⚠️Etapa 4: Classificando alertas...")
-        
-        def classificar_alerta(row):
-            if row['risco_correlado'] > 0.70 or row['anomalia_ia']:
-                return 'CRÍTICO'
-            elif row['risco_correlado'] > 0.40:
-                return 'ALERTA'
-            elif row['anomalia_ia']:
-                return 'ATENÇÃO'
-            else:
-                return 'NORMAL'
-        
-        dados['nivel_alerta'] = dados.apply(classificar_alerta, axis=1)
-        
-        # ETAPA 5: Identificar fatores de risco presentes
-        print("Etapa 5: Identificando fatores de risco...")
-        
-        def identificar_fatores(row):
-            fatores = []
-            if row['temperatura'] > 70:
-                fatores.append('Temperatura Elevada')
-            if row['vibracao'] > 7:
-                fatores.append('Vibração Alta')
-            if row['pressao'] > 20:
-                fatores.append('Pressão Elevada')
-            if row['fadiga_operador'] > 7:
-                fatores.append('Fadiga do Operador')
-            if row['umidade'] > 80 or row['umidade'] < 20:
-                fatores.append('Umidade Anômala')
-            return ', '.join(fatores) if fatores else 'Nenhum'
-        
-        dados['fatores_presentes'] = dados.apply(identificar_fatores, axis=1)
-        
-        self.historico = dados
-        return dados
-    
-    def gerar_relatorio_resumido(self):
-        """Gera relatório resumido dos resultados"""
-        if self.historico.empty:
-            print("Nenhum dado processado!")
-            return
-        
-        print("\n" + "="*70)
-        print("RELATÓRIO EXECUTIVO - NEXUS-SAFE")
-        print("="*70)
-        
-        print(f"\nESTATÍSTICAS GERAIS:")
-        print(f"  • Total de leituras analisadas: {len(self.historico)}")
-        print(f"  • Período: {self.historico['timestamp'].min()} a {self.historico['timestamp'].max()}")
-        
-        print(f"\nDETECÇÃO DE ANOMALIAS (IA):")
-        anomalias_detectadas = self.historico['anomalia_ia'].sum()
-        print(f"  • Anomalias detectadas: {anomalias_detectadas} ({anomalias_detectadas/len(self.historico)*100:.1f}%)")
-        
-        print(f"\nDISTRIBUIÇÃO DE ALERTAS:")
-        distribuicao = self.historico['nivel_alerta'].value_counts()
-        for alerta, qtd in distribuicao.items():
-            percentual = qtd / len(self.historico) * 100
-            simbolos = {'CRÍTICO': '!!!', 'ALERTA': '!', 'ATENÇÃO': '?', 'NORMAL': 'OK'}
-            print(f" {simbolos.get(alerta, '•'):6} {alerta:12} : {qtd:3} ({percentual:5.1f}%)")
-        
-        print(f"\nANÁLISE DE RISCO:")
-        print(f"  • Risco médio: {self.historico['risco_correlado'].mean()*100:6.2f}%")
-        print(f"  • Risco mínimo: {self.historico['risco_correlado'].min()*100:6.2f}%")
-        print(f"  • Risco máximo: {self.historico['risco_correlado'].max()*100:6.2f}%")
-        
-        print(f"\nFATORES DE RISCO MAIS FREQUENTES:")
-        todos_fatores = []
-        for fatores_str in self.historico['fatores_presentes']:
-            if fatores_str != 'Nenhum':
-                todos_fatores.extend(fatores_str.split(', '))
-        
-        if todos_fatores:
-            fator_counts = pd.Series(todos_fatores).value_counts()
-            for fator, qtd in fator_counts.head(5).items():
-                print(f"  • {fator:25}: {qtd:3} ocorrências")
-        
-        print("\n" + "="*70)
-    
-    def gerar_relatorio_detalhado(self, n_casos=10):
-        """
-        Gera relatório com casos específicos de risco
-        
-        Args:
-            n_casos: número de casos críticos a mostrar
-        """
-        if self.historico.empty:
-            print("Nenhum dado processado!")
-            return
-        
-        print("\n" + "="*70)
-        print("🔍 CASOS CRÍTICOS IDENTIFICADOS")
-        print("="*70)
-        
-        # Filtrar casos críticos
-        criticos = self.historico[self.historico['nivel_alerta'] == 'CRÍTICO'].head(n_casos)
-        
-        if len(criticos) == 0:
-            print("✓ Nenhum caso crítico encontrado!")
-            return
-        
-        for idx, (i, row) in enumerate(criticos.iterrows(), 1):
-            print(f"\nCASO #{idx}")
-            print(f"  Timestamp: {row['timestamp']}")
-            print(f"  Nível de Alerta: {row['nivel_alerta']}")
-            print(f"  Risco Correlado: {row['risco_correlado']*100:.1f}%")
-            print(f"  Score Anomalia (IA): {row['score_anomalia']:.3f}")
-            print(f"  Fatores Presentes: {row['fatores_presentes']}")
-            print(f"  \n  Leituras dos Sensores:")
-            print(f"    • Temperatura: {row['temperatura']:.1f}°C")
-            print(f"    • Vibração: {row['vibracao']:.2f}")
-            print(f"    • Pressão: {row['pressao']:.2f} bar")
-            print(f"    • Fadiga Operador: {row['fadiga_operador']:.1f}")
-            print(f"    • Umidade: {row['umidade']:.1f}%")
-        
-        print("\n" + "="*70)
-    
-    def gerar_grafico_timeline(self):
-        """Gera visualização de risco ao longo do tempo"""
-        if self.historico.empty:
-            return
-        
-        # Usar os últimos 50 registros para melhor visualização
-        dados_plot = self.historico.tail(50).copy()
-        dados_plot['index'] = range(len(dados_plot))
-        
-        print("\n" + "="*70)
-        print("📈 TIMELINE DE RISCO (Últimas 50 leituras)")
-        print("="*70)
-        
-        # Escala simplificada
-        for idx, row in dados_plot.iterrows():
-            risco_pct = row['risco_correlado']
-            num_barras = int(risco_pct * 50)
-            
-            if risco_pct > 0.70:
-                cor = "🔴"
-            elif risco_pct > 0.40:
-                cor = "🟠"
-            elif risco_pct > 0.20:
-                cor = "🟡"
-            else:
-                cor = "🟢"
-            
-            barra = "█" * num_barras + "░" * (50 - num_barras)
-            print(f"{row['index']:3} {cor} {barra} {risco_pct*100:5.1f}%")
-        
-        print("="*70)
+        self.log.append(registro)
+
+        evento = nivel != 'NORMAL' or preditivo
+        if evento or msg_tags['seq'] % HEARTBEAT == 0:
+            payload = {**registro, 'id_no': self.id, 'leitura': leitura,
+                       'tipo': 'evento' if evento else 'heartbeat', 't_envio': time.perf_counter()}
+            self.enviados.append(payload)
+            self.bus.publicar(f'nexus/{self.id}/{payload["tipo"]}', payload)
 
 
-# ================================================================================
-# 4. DEMONSTRAÇÃO E TESTE
-# ================================================================================
+# ==============================================================================
+# 6. GÊMEO DIGITAL SIMPLIFICADO
+# ==============================================================================
 
-def main():
-    """Função principal - executa o protótipo completo"""
-    print("\n" + "="*70)
-    print("NEXUS-SAFE - PROTÓTIPO DE SISTEMA DE DETECÇÃO DE RISCOS")
-    print("="*70)
-    
-    # Criar instância do sistema
-    sistema = NEXUS_SAFE()
-    
-    # PASSO 1: Gerar dados simulados
-    print("\nPASSO 1: Gerando dados simulados de sensores...")
-    dados = sistema.gerar_dados_simulados(n_leituras=200)
-    print(f"✓ {len(dados)} leituras geradas")
-    print(f"  Período: {dados['timestamp'].min()} a {dados['timestamp'].max()}")
-    
-    # PASSO 2: Processar dados
-    print("\nPASSO 2: Processando dados com Grafo + IA...")
-    dados_analisados = sistema.processar_dados(dados)
-    
-    # PASSO 3: Gerar relatórios
-    print("\nPASSO 3: Gerando relatórios...")
-    sistema.gerar_relatorio_resumido()
-    sistema.gerar_relatorio_detalhado(n_casos=5)
-    sistema.gerar_grafico_timeline()
-    
-    # PASSO 4: Mostrar algumas linhas dos dados
-    print("\n" + "="*70)
-    print("AMOSTRA DOS DADOS PROCESSADOS (Primeiras 10 linhas)")
-    print("="*70)
-    
-    colunas_principais = ['temperatura', 'vibracao', 'pressao', 'fadiga_operador', 
-                          'risco_correlado', 'nivel_alerta', 'anomalia_ia']
-    
-    print(dados_analisados[colunas_principais].head(10).to_string())
-    
-    # PASSO 5: Exportar dados para arquivo
-    print("\n" + "="*70)
-    print("PASSO 4: Exportando resultados...")
-    
-    # Salvar CSV
-    arquivo_csv = Path("nexus_safe_resultados.csv")
-    dados_analisados.to_csv(arquivo_csv, index=False)
-    print(f"✓ Dados exportados para: {arquivo_csv}")
-    
-    # Salvar JSON com resumo
-    resumo = {
-        'total_leituras': len(dados_analisados),
-        'anomalias_detectadas': int(dados_analisados['anomalia_ia'].sum()),
-        'risco_medio_pct': float(dados_analisados['risco_correlado'].mean() * 100),
-        'risco_maximo_pct': float(dados_analisados['risco_correlado'].max() * 100),
-        'distribuicao_alertas': dados_analisados['nivel_alerta'].value_counts().to_dict(),
+class GemeoDigital:
+    """Representação virtual do estado da máquina/operador, com simulação 'e se?'.
+    Não é um modelo físico: reutiliza o Grafo de Risco para avaliar alterações hipotéticas."""
+
+    def __init__(self, id_maquina):
+        self.id = id_maquina
+        self.grafo = GrafoRiscoEmergente()
+        self.estado = {}
+        self.historico = deque(maxlen=500)
+
+    def sincronizar(self, leitura):
+        self.estado = dict(leitura)
+        self.historico.append(dict(leitura))
+
+    def simular(self, alteracoes, estado_base=None):
+        base = dict(estado_base or self.estado)
+        antes = self.grafo.calcular(base)
+        depois = self.grafo.calcular({**base, **alteracoes})
+        return {
+            'alteracoes': alteracoes,
+            'risco_antes': antes['risco'],
+            'risco_depois': depois['risco'],
+            'variacao': depois['risco'] - antes['risco'],
+            'ganho_correlacao': depois['ganho_correlacao'],
+            'fatores_depois': depois['fatores'],
+        }
+
+
+# ==============================================================================
+# 7. NÓ CENTRAL (nuvem) - treino, validação de mensagens, consolidação
+# ==============================================================================
+
+class NoCentral(threading.Thread):
+    def __init__(self, barramento):
+        super().__init__(daemon=True)
+        self.bus = barramento
+        self.gemeo = GemeoDigital('MAQ01')
+        self.eventos = []
+        self.latencias_ms = []
+        self.rejeitadas = {'assinatura_invalida': 0, 'replay': 0}
+        self._ultima_seq = {}
+
+    @staticmethod
+    def treinar_modelo(baseline):
+        return DetectorAnomaliasIA().treinar(baseline)
+
+    def run(self):
+        while True:
+            msg = self.bus.consumir()
+            if msg is None:
+                break
+            payload = self.bus.validar(msg)
+            if payload is None:
+                self.rejeitadas['assinatura_invalida'] += 1
+                continue
+            if payload['seq'] <= self._ultima_seq.get(payload['id_no'], -1):
+                self.rejeitadas['replay'] += 1
+                continue
+            self._ultima_seq[payload['id_no']] = payload['seq']
+            self.latencias_ms.append((time.perf_counter() - payload['t_envio']) * 1000)
+            self.gemeo.sincronizar(payload['leitura'])
+            self.eventos.append(payload)
+
+
+# ==============================================================================
+# 8. AVALIAÇÃO EXPERIMENTAL
+# ==============================================================================
+
+def regra_isolada(df):
+    """Baseline sem correlação: qualquer variável física acima do seu limiar (presença não conta)."""
+    flag = pd.Series(False, index=df.index)
+    for col, f in FATORES.items():
+        if col == 'presenca_area_risco':
+            continue
+        x = (df[col] - f['centro']).abs() if 'centro' in f else df[col]
+        flag |= x >= f['limiar']
+    return flag
+
+
+def metricas(y, pred):
+    p, r, f1, _ = precision_recall_fscore_support(y, pred, average='binary', zero_division=0)
+    return {'precisao': round(float(p), 3), 'recall': round(float(r), 3), 'f1': round(float(f1), 3)}
+
+
+def avaliar(df):
+    d = df[df['cenario'] != 'deriva'].copy()
+    metodos = {
+        'A) Regra isolada (limiares)': d['regra_isolada'],
+        'B) Isolation Forest': d['anomalia_ia'],
+        'C) Grafo de risco': d['risco'] >= NIVEIS['ATENCAO'],
+        'D) Grafo + IA (nível != NORMAL)': d['nivel'] != 'NORMAL',
     }
-    
-    arquivo_json = Path("nexus_safe_resumo.json")
-    with open(arquivo_json, 'w', encoding='utf-8') as f:
-        json.dump(resumo, f, ensure_ascii=False, indent=2)
-    print(f"✓ Resumo exportado para: {arquivo_json}")
-    
-    print("\n" + "="*70)
-    print("PROTÓTIPO EXECUTADO COM SUCESSO!")
-    print("="*70)
-    
-    return sistema, dados_analisados
+    geral = {nome: metricas(d['rotulo_real'], pred.astype(int)) for nome, pred in metodos.items()}
+    positivos = d[d['rotulo_real'] == 1]
+    recall_cenario = {
+        nome: {c: round(float(pred[positivos.index][positivos['cenario'] == c].mean()), 3)
+               for c in sorted(positivos['cenario'].unique())}
+        for nome, pred in metodos.items()
+    }
+
+    # Predição: antecedência = minutos entre o alerta preditivo e o risco CRÍTICO (por deriva)
+    antecedencias = []
+    for e in sorted(df.loc[df['episodio'] >= 0, 'episodio'].unique()):
+        ep = df[df['episodio'] == e].reset_index(drop=True)
+        crit = ep.index[ep['risco'] >= NIVEIS['CRITICO']]
+        prev = ep.index[ep['alerta_preditivo']]
+        if len(crit):
+            antecedencias.append(int(crit[0] - prev[0]) if len(prev) else None)
+    validas = [a for a in antecedencias if a is not None and a > 0]
+    normais = df[df['cenario'] == 'normal']
+    predicao = {
+        'antecedencia_por_deriva_min': antecedencias,
+        'antecedencia_media_min': round(float(np.mean(validas)), 2) if validas else 0.0,
+        'derivas_com_antecedencia': f'{len(validas)}/{len(antecedencias)}',
+        'falso_alarme_preditivo_em_normais_pct': round(float(normais['alerta_preditivo'].mean() * 100), 2),
+    }
+
+    # Risco emergente: casos que só atingem CRÍTICO por causa das correlações (soma individual < limite)
+    emergente = d[(d['risco_individual'] < NIVEIS['CRITICO']) & (d['risco'] >= NIVEIS['CRITICO'])]
+    return {'geral': geral, 'recall_por_cenario': recall_cenario, 'predicao': predicao,
+            'casos_risco_emergente': int(len(emergente)),
+            'casos_emergentes_que_regra_isolada_perdeu': int((~emergente['regra_isolada']).sum())}
 
 
-if __name__ == "__main__":
-    sistema, dados = main()
+# ==============================================================================
+# 9. PIPELINE COMPLETO
+# ==============================================================================
+
+def executar(n_leituras=600, seed=42, ritmo_s=0.0, pasta=Path('.'), verbose=True):
+    pasta = Path(pasta)
+    sim = SimuladorSCADA(seed=seed)
+    baseline = sim.gerar_baseline(1000)
+    teste = sim.gerar_teste(n_leituras)
+
+    bus = Barramento()
+    central = NoCentral(bus)
+    borda = NoBorda('borda-MAQ01', bus)
+    borda.implantar_modelo(central.treinar_modelo(baseline))   # treino na central -> inferência na borda
+    central.start()
+
+    for seq, (_, linha) in enumerate(teste.iterrows(), start=1):   # "tempo real": leitura a leitura
+        borda.processar(sim.para_tags(linha, seq))
+        if ritmo_s:
+            time.sleep(ritmo_s)
+
+    trafego = {'mensagens_legitimas': bus.mensagens, 'bytes': bus.bytes}
+    # Testes de segurança: mensagem forjada (assinatura inválida) e repetição de mensagem antiga (replay)
+    bus.publicar('nexus/borda-MAQ01/evento', {**borda.enviados[-1], 'seq': 10**6}, assinatura='0' * 64)
+    bus.publicar('nexus/borda-MAQ01/evento', borda.enviados[0])
+    bus.encerrar()
+    central.join()
+
+    # Junta o log da borda com os rótulos do gerador
+    log = pd.DataFrame(borda.log).set_index('seq')
+    df = teste.copy()
+    df.index = df.index + 1
+    df = df.join(log.drop(columns=['ts']))
+    df['regra_isolada'] = regra_isolada(df)
+    df.index.name = 'seq'
+
+    n = len(df)
+    trafego.update({
+        'leituras_brutas': n,
+        'reducao_mensagens_pct': round((1 - trafego['mensagens_legitimas'] / n) * 100, 1),
+        'latencia_borda_media_ms': round(float(df['proc_ms'].mean()), 2),
+        'latencia_borda_p95_ms': round(float(df['proc_ms'].quantile(0.95)), 2),
+        'latencia_fim_a_fim_media_ms': round(float(np.mean(central.latencias_ms)), 2),
+    })
+
+    gemeo_demo = central.gemeo.simular(
+        {'vibracao': 5.5, 'temperatura': 64, 'fadiga_operador': 6, 'presenca_area_risco': 1},
+        estado_base={'temperatura': 45, 'vibracao': 2.2, 'pressao': 10.5, 'fadiga_operador': 3,
+                     'umidade': 50, 'presenca_area_risco': 1})
+
+    resumo = {
+        'total_leituras': n,
+        'distribuicao_alertas': df['nivel'].value_counts().to_dict(),
+        'risco_medio_pct': round(float(df['risco'].mean() * 100), 2),
+        'risco_maximo_pct': round(float(df['risco'].max() * 100), 2),
+        'avaliacao': avaliar(df),
+        'trafego_e_latencia': trafego,
+        'seguranca_mensagens': {**central.rejeitadas, 'eventos_aceitos': len(central.eventos)},
+        'gemeo_digital_what_if': gemeo_demo,
+        'grafo': {'nos': GrafoRiscoEmergente().G.number_of_nodes(),
+                  'arestas': GrafoRiscoEmergente().G.number_of_edges()},
+    }
+
+    df.to_csv(pasta / 'nexus_safe_resultados.csv')
+    (pasta / 'nexus_safe_resumo.json').write_text(json.dumps(resumo, ensure_ascii=False, indent=2), encoding='utf-8')
+    if verbose:
+        imprimir_resumo(resumo)
+    return df, resumo
+
+
+def imprimir_resumo(r):
+    a = r['avaliacao']
+    t = r['trafego_e_latencia']
+    print('=' * 72)
+    print('NEXUS SAFE v2 - RESULTADOS')
+    print('=' * 72)
+    print(f"Leituras: {r['total_leituras']} | Alertas: {r['distribuicao_alertas']}")
+    print('\nDesempenho (rótulos reais do gerador, derivas excluídas):')
+    for nome, m in a['geral'].items():
+        print(f"  {nome:34} P={m['precisao']:.3f}  R={m['recall']:.3f}  F1={m['f1']:.3f}")
+    print('\nRecall por cenário:')
+    for nome, d in a['recall_por_cenario'].items():
+        print(f"  {nome:34} " + '  '.join(f'{c}={v:.2f}' for c, v in d.items()))
+    p = a['predicao']
+    print(f"\nPredição: antecedência média {p['antecedencia_media_min']} min "
+          f"({p['derivas_com_antecedencia']} derivas) | falso alarme preditivo em normais: "
+          f"{p['falso_alarme_preditivo_em_normais_pct']}%")
+    print(f"Risco emergente: {a['casos_risco_emergente']} casos "
+          f"({a['casos_emergentes_que_regra_isolada_perdeu']} perdidos pela regra isolada)")
+    print(f"\nBorda: {t['mensagens_legitimas']} mensagens para {t['leituras_brutas']} leituras "
+          f"(redução {t['reducao_mensagens_pct']}%) | latência média {t['latencia_borda_media_ms']} ms "
+          f"(p95 {t['latencia_borda_p95_ms']} ms)")
+    print(f"Segurança: {r['seguranca_mensagens']}")
+    g = r['gemeo_digital_what_if']
+    print(f"Gêmeo digital (what-if): risco {g['risco_antes']:.2f} -> {g['risco_depois']:.2f} "
+          f"(ganho por correlação {g['ganho_correlacao']:.2f})")
+    print('=' * 72)
+
+
+if __name__ == '__main__':
+    ritmo = 0.05 if '--tempo-real' in sys.argv else 0.0
+    executar(ritmo_s=ritmo)
