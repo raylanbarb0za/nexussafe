@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="5e4d7611-49b9-4b86-881b-feca4ee50982" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/nexus_safe_prototype.py" beforeDir="false" afterPath="$PROJECT_DIR$/nexus_safe_prototype.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/nexus_safe_resultados.csv" beforeDir="false" afterPath="$PROJECT_DIR$/nexus_safe_resultados.csv" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/nexus_safe_resumo.json" beforeDir="false" afterPath="$PROJECT_DIR$/nexus_safe_resumo.json" afterDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="FileTemplateManagerImpl">
+    <option name="RECENT_TEMPLATES">
+      <list>
+        <option value="Python Script" />
+      </list>
+    </option>
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="McpProjectServerCommands">
+    <commands />
+    <urls />
+  </component>
+  <component name="NextEditCompletionFeaturesState">
+    <decayedCancelled>
+      <entry key="MS100" value="1.000133071002386" />
+      <entry key="MS500" value="1.6292392231862363" />
+      <entry key="S2" value="6.36393023035349" />
+      <entry key="S5" value="13.687070059949393" />
+      <entry key="S10" value="26.082254091566206" />
+      <entry key="S30" value="62.15346266825268" />
+      <entry key="S60" value="85.33768775569506" />
+      <entry key="M2" value="103.60339260260943" />
+      <entry key="M5" value="137.6397285445126" />
+      <entry key="M10" value="215.51614289320804" />
+      <entry key="M15" value="295.7443617819382" />
+      <entry key="M30" value="463.955582324287" />
+      <entry key="H1" value="613.8987572987014" />
+      <entry key="H2" value="715.8252303082031" />
+      <entry key="H4" value="775.5212466324093" />
+      <entry key="D1" value="830.4148905116524" />
+      <entry key="W1" value="840.332134527567" />
+    </decayedCancelled>
+    <decayedSelected>
+      <entry key="MS100" value="0.0" />
+      <entry key="MS500" value="0.0" />
+      <entry key="S2" value="1.7609017486022525E-153" />
+      <entry key="S5" value="1.1095182871597384E-61" />
+      <entry key="S10" value="4.640517418895364E-31" />
+      <entry key="S30" value="1.224765294346162E-10" />
+      <entry key="S60" value="1.5650349748644337E-5" />
+      <entry key="M2" value="0.005703055406527691" />
+      <entry key="M5" value="0.23491156701735677" />
+      <entry key="M10" value="1.0401637143582887" />
+      <entry key="M15" value="1.886058449768946" />
+      <entry key="M30" value="3.706324804827038" />
+      <entry key="H1" value="5.379716401950564" />
+      <entry key="H2" value="6.540526115344493" />
+      <entry key="H4" value="7.22811607820239" />
+      <entry key="D1" value="7.8650367039506826" />
+      <entry key="W1" value="7.980558424239708" />
+    </decayedSelected>
+    <decayedShown>
+      <entry key="MS100" value="0.9727840931207071" />
+      <entry key="MS500" value="1.615172789874723" />
+      <entry key="S2" value="6.343735672814255" />
+      <entry key="S5" value="13.669503689549954" />
+      <entry key="S10" value="26.066562822331793" />
+      <entry key="S30" value="62.14187658393476" />
+      <entry key="S60" value="85.32978013818507" />
+      <entry key="M2" value="103.60414437237492" />
+      <entry key="M5" value="137.86989355294784" />
+      <entry key="M10" value="216.5494840804685" />
+      <entry key="M15" value="297.62273414391467" />
+      <entry key="M30" value="467.65466881886283" />
+      <entry key="H1" value="619.2732899871742" />
+      <entry key="H2" value="722.362621563058" />
+      <entry key="H4" value="782.747634434069" />
+      <entry key="D1" value="838.2796143361279" />
+      <entry key="W1" value="848.312647611279" />
+    </decayedShown>
+  </component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 8,
+  &quot;fromUser&quot;: false
+}</component>
+  <component name="ProjectId" id="3JyB1P59JIB0lMyqArX6KDNre0K" />
+  <component name="ProjectLevelVcsManager">
+    <ConfirmationsSetting value="1" id="Add" />
+  </component>
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "Python.dashboard.executor": "Run",
+    "Python.nexus_safe_prototype.executor": "Run",
+    "RunOnceActivity.MCP Project settings loaded": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "RunOnceActivity.typescript.service.memoryLimit.init": "true",
+    "codeWithMe.voiceChat.enabledByDefault": "false",
+    "com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1": "true",
+    "git-widget-placeholder": "main",
+    "junie.onboarding.icon.badge.shown": "true",
+    "last_opened_file_path": "C:/Users/Raylan Barboza/Documents/Faculdade/PRÉ-TCC/nexus",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "python.packages.toolwindow.project.migrated.to.right.top.v2": "true",
+    "settings.editor.selected.configurable": "com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable",
+    "to.speed.mode.migration.done": "true"
+  }
+}]]></component>
+  <component name="SharedIndexes">
+    <attachedChunks>
+      <set>
+        <option value="bundled-python-sdk-73a66231627c-5bd6d13a2a75-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-262.10968.92" />
+      </set>
+    </attachedChunks>
+  </component>
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="5e4d7611-49b9-4b86-881b-feca4ee50982" name="Changes" comment="" />
+      <created>1790623211812</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1790623211812</updated>
+    </task>
+    <servers />
+  </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
+  </component>
+</project>
