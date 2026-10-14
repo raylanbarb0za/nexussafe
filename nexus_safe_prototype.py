@@ -11,9 +11,6 @@ O que esta versão implementa (tudo SIMULADO em um único computador, em Python)
   - Predição                    : tendência (regressão linear em janela) projetada para N minutos
   - Gêmeo Digital simplificado  : estado virtual da máquina + simulação "e se?" (what-if)
   - Avaliação                   : precisão/recall/F1 contra rótulos reais do gerador e baselines
-
-Limitações (declarar no texto do TCC): dados sintéticos, um único processo (threads + fila),
-pesos das arestas definidos por especialista (não aprendidos), sem protocolo industrial real.
 """
 
 import hashlib
@@ -36,9 +33,9 @@ from sklearn.metrics import precision_recall_fscore_support
 # 0. CONFIGURAÇÃO (fonte única de verdade para limiares, pesos e correlações)
 # ==============================================================================
 
-# inicio  = valor a partir do qual o fator começa a contribuir (ativação > 0)
-# limiar  = valor em que o fator é considerado totalmente ativo (ativação = 1)
-# centro  = quando existe, o desvio é medido em relação a ele (ex.: umidade)
+# [EXPLICAÇÃO]: Aqui ficam as regras básicas dos seus sensores[cite: 1]. 
+# inicio = valor normal; limiar = valor perigoso; peso = gravidade[cite: 1].
+# [O QUE ALTERAR]: Para adicionar um sensor novo (ex: 'fluxo_agua'), basta criar uma nova linha aqui com seus limites[cite: 1].
 FATORES = {
     'temperatura':         dict(no='temp',     rotulo='Temperatura elevada',       peso=0.30, inicio=55,  limiar=70),
     'vibracao':            dict(no='vibra',    rotulo='Vibração alta',             peso=0.35, inicio=4.5, limiar=7),
@@ -48,7 +45,8 @@ FATORES = {
     'presenca_area_risco': dict(no='presenca', rotulo='Operador em área de risco', peso=0.20, inicio=0,   limiar=1),
 }
 
-# (origem, destino, peso): quando os dois fatores estão ativos, o risco é amplificado
+# [EXPLICAÇÃO]: Quando dois problemas acontecem ao mesmo tempo, o perigo aumenta (se multiplicam)[cite: 1].
+# [O QUE ALTERAR]: Se você adicionou um sensor acima, crie as combinações perigosas dele aqui[cite: 1].
 CORRELACOES = [
     ('temp', 'vibra', 0.60),
     ('vibra', 'fadiga', 0.50),
@@ -58,9 +56,10 @@ CORRELACOES = [
     ('presenca', 'vibra', 0.50),
 ]
 
+# [EXPLICAÇÃO]: O limite de pontuação de risco para disparar os alarmes[cite: 1].
 NIVEIS = {'CRITICO': 0.70, 'ALERTA': 0.40, 'ATENCAO': 0.25}
 
-# "Tags" no estilo SCADA -> variável interna
+# [EXPLICAÇÃO]: Traduz o nome técnico do sensor na fábrica (ex: MAQ01.TEMP) para o nome no código (temperatura)[cite: 1].
 TAG_PARA_COLUNA = {
     'MAQ01.TEMP': 'temperatura',
     'MAQ01.VIB': 'vibracao',
@@ -70,14 +69,18 @@ TAG_PARA_COLUNA = {
     'AREA01.PRESENCA': 'presenca_area_risco',
 }
 
-CHAVE_SECRETA = b'chave-de-demonstracao'   # em produção: gerenciada por cofre de segredos
-HEARTBEAT = 60                              # a cada N leituras o nó de borda envia um sinal de vida
-HORIZONTE_MIN = 8                           # quantos minutos à frente a tendência é projetada
-JANELA_TENDENCIA = 8                        # leituras usadas para estimar a tendência
+CHAVE_SECRETA = b'chave-de-demonstracao'   # Senha para garantir segurança das mensagens
+HEARTBEAT = 60                              # Envia um "Estou vivo" a cada 60 leituras
+HORIZONTE_MIN = 8                           # Quantos minutos no futuro o sistema vai tentar prever
+JANELA_TENDENCIA = 8                        # Quantas leituras passadas usar para adivinhar o futuro
 
 
 def classificar_nivel(risco, anomalia_ia):
-    """Corrige o ramo inalcançável da v1: a IA sozinha só eleva a ATENÇÃO."""
+    """
+    [EXPLICAÇÃO]: Transforma um número de risco (ex: 0.80) em um alerta legível ('CRÍTICO')[cite: 1].
+    [O QUE ALTERAR]: Se quiser criar um nível "PERIGO EXTREMO", adicione a regra (o IF) aqui e o valor na variável NIVEIS[cite: 1].
+    Corrige o ramo inalcançável da v1: a IA sozinha só eleva a ATENÇÃO.
+    """
     if risco >= NIVEIS['CRITICO']:
         return 'CRÍTICO'
     if risco >= NIVEIS['ALERTA']:
@@ -92,10 +95,14 @@ def classificar_nivel(risco, anomalia_ia):
 # ==============================================================================
 
 class GrafoRiscoEmergente:
-    """Nós = fatores de risco; arestas ponderadas = contribuição individual e correlações.
-    O risco final é calculado A PARTIR do grafo (v1 apenas o desenhava)."""
+    """
+    [EXPLICAÇÃO]: Constrói a rede lógica. Ele soma os riscos de cada sensor.
+    Nós = fatores de risco; arestas ponderadas = contribuição individual e correlações.
+    O risco final é calculado A PARTIR do grafo.
+    """
 
     def __init__(self):
+        # [O QUE FAZ]: Inicializa os sensores e as pontes entre eles utilizando as configurações[cite: 1].
         self.G = nx.DiGraph()
         for col, f in FATORES.items():
             self.G.add_node(f['no'], coluna=col, label=f['rotulo'], ativacao=0.0)
@@ -107,6 +114,7 @@ class GrafoRiscoEmergente:
 
     @staticmethod
     def _ativacao(f, valor):
+        # [O QUE FAZ]: Converte o valor medido em uma nota de 0 (seguro) a 1 (perigo total) baseando-se no 'limiar'[cite: 1].
         x = abs(valor - f['centro']) if 'centro' in f else valor
         return float(np.clip((x - f['inicio']) / (f['limiar'] - f['inicio']), 0.0, 1.0))
 
@@ -114,7 +122,10 @@ class GrafoRiscoEmergente:
         return {f['no']: self._ativacao(f, leitura[col]) for col, f in FATORES.items()}
 
     def calcular(self, leitura, persistir=False):
-        """Retorna o risco (0-1). Com persistir=True o estado dos nós é atualizado (grafo dinâmico)."""
+        """
+        [EXPLICAÇÃO]: Esta função realiza a matemática do risco e aplica as regras de correlação para amplificar ameaças simultâneas[cite: 1].
+        Retorna o risco (0-1). Com persistir=True o estado dos nós é atualizado (grafo dinâmico).
+        """
         ativ = self.ativacoes(leitura)
         if persistir:
             nx.set_node_attributes(self.G, ativ, 'ativacao')
@@ -139,12 +150,14 @@ class GrafoRiscoEmergente:
 # ==============================================================================
 
 class SimuladorSCADA:
+    # [EXPLICAÇÃO]: Forja dados como se viessem de sensores verdadeiros para permitir os testes sem a máquina de verdade[cite: 1].
     TIPOS_PONTUAIS = ['temp_alta', 'vibra_alta', 'pressao_temp', 'combinado_acima', 'combinado_sublimiar']
 
     def __init__(self, seed=42):
         self.rng = np.random.default_rng(seed)
 
     def _normal(self, n):
+        # [O QUE ALTERAR]: Se mudar algum sensor lá no topo (FATORES), tem que criar a média falsa de funcionamento normal dele aqui embaixo[cite: 1].
         r = self.rng
         return pd.DataFrame({
             'temperatura': r.normal(45, 3, n),
@@ -156,10 +169,13 @@ class SimuladorSCADA:
         })
 
     def gerar_baseline(self, n=1000):
-        """Histórico de operação normal, usado só para TREINAR o modelo (separado do teste)."""
+        """
+        [EXPLICAÇÃO]: Histórico de operação normal, usado só para TREINAR o modelo de IA (separado do teste)[cite: 1].
+        """
         return self._normal(n)
 
     def gerar_teste(self, n=600, n_por_tipo=10, n_derivas=4, comp_deriva=15):
+        # [EXPLICAÇÃO]: Cria dados com defeitos artificiais injetados para testar se as contas estão apitando os alarmes certos[cite: 1].
         r = self.rng
         df = self._normal(n)
         df['timestamp'] = pd.date_range('2026-10-01 08:00', periods=n, freq='min')
@@ -207,6 +223,7 @@ class SimuladorSCADA:
 
     @staticmethod
     def para_tags(linha, seq):
+        # [O QUE FAZ]: Formata as informações para parecerem dados enviados por equipamentos reais nas fábricas[cite: 1].
         tags = {tag: float(linha[col]) for tag, col in TAG_PARA_COLUNA.items()}
         return {'seq': seq, 'ts': str(linha['timestamp']), 'qualidade': 'GOOD', 'tags': tags}
 
@@ -216,18 +233,23 @@ class SimuladorSCADA:
 # ==============================================================================
 
 class DetectorAnomaliasIA:
-    """Isolation Forest treinado em histórico NORMAL (aprendizado não supervisionado).
-    Não usa StandardScaler: árvores de isolamento não dependem de escala."""
+    """
+    [EXPLICAÇÃO]: Usa IA (Machine Learning) para encontrar anomalias. 
+    Isolation Forest treinado em histórico NORMAL (aprendizado não supervisionado).
+    Não usa StandardScaler: árvores de isolamento não dependem de escala.
+    """
 
     def __init__(self, taxa_falso_alarme=0.01):
         self.modelo = IsolationForest(n_estimators=100, contamination=taxa_falso_alarme, random_state=42)
         self.colunas = list(FATORES)
 
     def treinar(self, baseline):
+        # [O QUE FAZ]: Ensina ao modelo o que é considerado "saudável"[cite: 1].
         self.modelo.fit(baseline[self.colunas].values)
         return self
 
     def avaliar(self, leitura):
+        # [O QUE FAZ]: Pega uma leitura nova e diz se é estranha ou não em relação ao treino[cite: 1].
         X = np.array([[leitura[c] for c in self.colunas]])
         anomalia = bool(self.modelo.predict(X)[0] == -1)
         score = float(-self.modelo.score_samples(X)[0])   # ~0.5 = fronteira; maior = mais anômalo
@@ -239,6 +261,7 @@ class DetectorAnomaliasIA:
 # ==============================================================================
 
 class Barramento:
+    # [EXPLICAÇÃO]: Imita o transporte de rede. Ele passa as mensagens dos sensores da máquina para o servidor central[cite: 1].
     def __init__(self, chave=CHAVE_SECRETA):
         self._q = queue.Queue()
         self._chave = chave
@@ -246,6 +269,7 @@ class Barramento:
         self.bytes = 0
 
     def _assinar(self, corpo):
+        # [O QUE FAZ]: Cria uma assinatura digital blindando os dados contra invasores e modificações[cite: 1].
         return hmac.new(self._chave, corpo.encode(), hashlib.sha256).hexdigest()
 
     def publicar(self, topico, payload, assinatura=None):
@@ -261,7 +285,10 @@ class Barramento:
         return self._q.get()
 
     def validar(self, msg):
-        """Retorna o payload se a assinatura for válida; caso contrário, None."""
+        """
+        [EXPLICAÇÃO]: Confere se o dado que chegou é autêntico e não foi alterado na rede antes de o sistema abrir[cite: 1].
+        Retorna o payload se a assinatura for válida; caso contrário, None.
+        """
         if not hmac.compare_digest(msg['assinatura'], self._assinar(msg['corpo'])):
             return None
         return json.loads(msg['corpo'])
@@ -272,6 +299,7 @@ class Barramento:
 # ==============================================================================
 
 class NoBorda:
+    # [EXPLICAÇÃO]: Representa um equipamento grudado na máquina rodando a IA de forma ultra-rápida[cite: 1].
     def __init__(self, id_no, barramento):
         self.id = id_no
         self.bus = barramento
@@ -282,10 +310,14 @@ class NoBorda:
         self.enviados = []
 
     def implantar_modelo(self, detector):
-        """Modelo treinado na central e implantado na borda (treino na nuvem, inferência na borda)."""
+        """
+        [O QUE FAZ]: Recebe a IA treinada do servidor e instala na máquina local.
+        Modelo treinado na central e implantado na borda (treino na nuvem, inferência na borda).
+        """
         self.detector = detector
 
     def _projetar(self):
+        # [EXPLICAÇÃO]: Tenta adivinhar (predição matemática) o que vai acontecer no futuro avaliando os dados dos últimos minutos[cite: 1].
         if len(self.janela) < self.janela.maxlen:
             return None
         cols = list(FATORES)
@@ -301,6 +333,8 @@ class NoBorda:
         return {c: max(v, 0.0) for c, v in proj.items()}
 
     def processar(self, msg_tags):
+        # [EXPLICAÇÃO]: Essa é a função principal que trabalha em tempo real. Pega as leituras e analisa TUDO[cite: 1].
+        # Ela é a responsável por não enviar lixo pra nuvem: só envia se de fato tiver um risco/evento (transmitindo menos arquivos)[cite: 1].
         t0 = time.perf_counter()
         leitura = {col: msg_tags['tags'][tag] for tag, col in TAG_PARA_COLUNA.items()}
         self.janela.append(leitura)
@@ -335,8 +369,11 @@ class NoBorda:
 # ==============================================================================
 
 class GemeoDigital:
-    """Representação virtual do estado da máquina/operador, com simulação 'e se?'.
-    Não é um modelo físico: reutiliza o Grafo de Risco para avaliar alterações hipotéticas."""
+    """
+    [EXPLICAÇÃO]: Permite você "brincar" com variáveis fictícias para avaliar como os riscos seriam na vida real ("what if" / "E Se?")[cite: 1].
+    Representação virtual do estado da máquina/operador, com simulação 'e se?'.
+    Não é um modelo físico: reutiliza o Grafo de Risco para avaliar alterações hipotéticas.
+    """
 
     def __init__(self, id_maquina):
         self.id = id_maquina
@@ -349,6 +386,7 @@ class GemeoDigital:
         self.historico.append(dict(leitura))
 
     def simular(self, alteracoes, estado_base=None):
+        # [O QUE FAZ]: Analisa o nível de risco entre as informações falsas que você inseriu em "alterações" contra o estado atual da máquina[cite: 1].
         base = dict(estado_base or self.estado)
         antes = self.grafo.calcular(base)
         depois = self.grafo.calcular({**base, **alteracoes})
@@ -367,6 +405,7 @@ class GemeoDigital:
 # ==============================================================================
 
 class NoCentral(threading.Thread):
+    # [EXPLICAÇÃO]: Simula o computador chefe (nuvem/servidor) onde chegam apenas as mensagens mais importantes e filtradas[cite: 1].
     def __init__(self, barramento):
         super().__init__(daemon=True)
         self.bus = barramento
@@ -381,6 +420,7 @@ class NoCentral(threading.Thread):
         return DetectorAnomaliasIA().treinar(baseline)
 
     def run(self):
+        # [O QUE FAZ]: Fica lendo a fila de forma automática recusando dados se a assinatura ou ordem não for segura[cite: 1].
         while True:
             msg = self.bus.consumir()
             if msg is None:
@@ -402,8 +442,12 @@ class NoCentral(threading.Thread):
 # 8. AVALIAÇÃO EXPERIMENTAL
 # ==============================================================================
 
+# [EXPLICAÇÃO]: Funções matemáticas que vão validar e dar notas ao sistema no final simulando se o programa de fato foi útil e se não falhou[cite: 1].
 def regra_isolada(df):
-    """Baseline sem correlação: qualquer variável física acima do seu limiar (presença não conta)."""
+    """
+    [EXPLICAÇÃO]: Método antigo usado por fábricas (se o sensor X ficar vermelho, avisa) para usar de comparação contra a inteligência nova desse projeto[cite: 1].
+    Baseline sem correlação: qualquer variável física acima do seu limiar (presença não conta).
+    """
     flag = pd.Series(False, index=df.index)
     for col, f in FATORES.items():
         if col == 'presenca_area_risco':
@@ -419,6 +463,7 @@ def metricas(y, pred):
 
 
 def avaliar(df):
+    # [O QUE FAZ]: Cruza os métodos e as precisões comparando de maneira técnica e retorna um relatório de eficiência[cite: 1].
     d = df[df['cenario'] != 'deriva'].copy()
     metodos = {
         'A) Regra isolada (limiares)': d['regra_isolada'],
@@ -463,24 +508,29 @@ def avaliar(df):
 # ==============================================================================
 
 def executar(n_leituras=600, seed=42, ritmo_s=0.0, pasta=Path('.'), verbose=True):
+    # [EXPLICAÇÃO]: Essa é a função principal que "liga" todos os botões que detalhamos acima[cite: 1].
     pasta = Path(pasta)
+    
+    # 1. Cria a simulação falsa[cite: 1]
     sim = SimuladorSCADA(seed=seed)
     baseline = sim.gerar_baseline(1000)
     teste = sim.gerar_teste(n_leituras)
 
+    # 2. Cria o servidor, o barramento e as conexões e Inicia a IA com os dados básicos de treino[cite: 1]
     bus = Barramento()
     central = NoCentral(bus)
     borda = NoBorda('borda-MAQ01', bus)
     borda.implantar_modelo(central.treinar_modelo(baseline))   # treino na central -> inferência na borda
     central.start()
 
+    # 3. Começa a testar e repassar os dados lidos 1 por 1[cite: 1]
     for seq, (_, linha) in enumerate(teste.iterrows(), start=1):   # "tempo real": leitura a leitura
         borda.processar(sim.para_tags(linha, seq))
         if ritmo_s:
             time.sleep(ritmo_s)
 
     trafego = {'mensagens_legitimas': bus.mensagens, 'bytes': bus.bytes}
-    # Testes de segurança: mensagem forjada (assinatura inválida) e repetição de mensagem antiga (replay)
+    # Testes de segurança: mensagem forjada (assinatura inválida) e repetição de mensagem antiga (replay)[cite: 1]
     bus.publicar('nexus/borda-MAQ01/evento', {**borda.enviados[-1], 'seq': 10**6}, assinatura='0' * 64)
     bus.publicar('nexus/borda-MAQ01/evento', borda.enviados[0])
     bus.encerrar()
@@ -521,6 +571,7 @@ def executar(n_leituras=600, seed=42, ritmo_s=0.0, pasta=Path('.'), verbose=True
                   'arestas': GrafoRiscoEmergente().G.number_of_edges()},
     }
 
+    # 4. Salva todo o histórico da simulação na sua pasta[cite: 1]
     df.to_csv(pasta / 'nexus_safe_resultados.csv')
     (pasta / 'nexus_safe_resumo.json').write_text(json.dumps(resumo, ensure_ascii=False, indent=2), encoding='utf-8')
     if verbose:
@@ -529,6 +580,7 @@ def executar(n_leituras=600, seed=42, ritmo_s=0.0, pasta=Path('.'), verbose=True
 
 
 def imprimir_resumo(r):
+    # [O QUE FAZ]: "Cuspi" (exibe) o relatório e todos os resumos diretamente na sua tela[cite: 1].
     a = r['avaliacao']
     t = r['trafego_e_latencia']
     print('=' * 72)
